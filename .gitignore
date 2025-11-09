@@ -2,6 +2,7 @@ data/photos/*
 data/json/*
 data/source/*
 data/compressed/*
+data/original/*
 
 .venv*
 *.DS_Store*
