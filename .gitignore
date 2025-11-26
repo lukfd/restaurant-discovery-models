@@ -9,5 +9,6 @@ logs/*
 models/basic_cnn/*
 *.jpg
 
+*__pycache__*
 .venv*
 *.DS_Store*
