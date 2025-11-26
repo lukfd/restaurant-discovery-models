@@ -4,6 +4,7 @@ data/source/*
 data/compressed/*
 data/original/*
 
+*.jpg*
 logs/*
 models/basic_cnn/*
 
