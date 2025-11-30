@@ -3,6 +3,7 @@ data/json/*
 data/source/*
 data/compressed/*
 data/original/*
+ppt/*
 
 *.jpg*
 logs/*

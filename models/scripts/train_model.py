@@ -11,13 +11,14 @@ import pyarrow as pa
 import torch
 from pyarrow import parquet
 from sklearn.metrics import classification_report
-from torchvision import models
+from torchvision import models, transforms
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchinfo import summary
 
 from image_data import ImageData
+import loop
 
 PHOTO_DIR = "data/clean/reduced_photos"
 DEVICE = (
@@ -26,7 +27,38 @@ DEVICE = (
     else "cpu"
 )
 
-transforms = models.ResNet18_Weights.DEFAULT.transforms()
+
+def get_transforms(model_type: str):
+    if model_type == "basic_cnn":
+        return models.ResNet18_Weights.DEFAULT.transforms()
+    elif model_type == "resnet18":
+        return models.ResNet18_Weights.DEFAULT.transforms()
+    elif model_type == "resnet50":
+        return models.ResNet50_Weights.DEFAULT.transforms()
+    elif model_type == "regnet_y_400mf":
+        return models.RegNet_Y_400MF_Weights.DEFAULT.transforms()
+    elif model_type == "regnet_y_8gf":
+        return models.RegNet_Y_8GF_Weights.DEFAULT.transforms()
+    else:
+        return models.ResNet18_Weights.DEFAULT.transforms()
+
+
+def get_train_transforms(model_type: str):
+    base_transform = get_transforms(model_type)
+
+    augmented_transforms = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1
+            ),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            base_transform,
+        ]
+    )
+
+    return augmented_transforms
 
 
 def get_model(model_type: str, model_loc: str) -> nn.Module:
@@ -34,7 +66,7 @@ def get_model(model_type: str, model_loc: str) -> nn.Module:
         from basic_cnn import BasicCNN
 
         model = BasicCNN().to(DEVICE)
-    elif model_type == "resnet":
+    elif model_type == "resnet18":
         if not model_loc:
             model = models.resnet18(weights="DEFAULT")
         else:
@@ -50,54 +82,27 @@ def get_model(model_type: str, model_loc: str) -> nn.Module:
 
         model.fc = nn.Linear(model.fc.in_features, 3)
         model = model.to(DEVICE)
+    elif model_type == "regnet_y_400mf":
+        if not model_loc:
+            model = models.regnet_y_400mf(weights="DEFAULT")
+        else:
+            model = models.regnet_y_400mf()
+
+        model.fc = nn.Linear(model.fc.in_features, 3)
+        model = model.to(DEVICE)
+    elif model_type == "regnet_y_8gf":
+        if not model_loc:
+            model = models.regnet_y_8gf(weights="DEFAULT")
+        else:
+            model = models.regnet_y_8gf()
+
+        model.fc = nn.Linear(model.fc.in_features, 3)
+        model = model.to(DEVICE)
     else:
         print(f"{model_type} not defined, exiting")
         raise Exception(f"{model_type} not defined")
 
     return model
-
-
-def get_loss(
-    m: nn.Module, inputs: torch.Tensor, labels: torch.Tensor, lf: nn.Module
-) -> torch.Tensor:
-    inputs, labels = (
-        inputs.to(DEVICE),
-        labels.to(DEVICE).to(torch.float32).squeeze(),
-    )
-    outputs = m(inputs)
-    loss = lf(outputs, labels)
-
-    return loss
-
-
-def train_one_epoch(m: nn.Module, loader: DataLoader, o: torch.optim.Optimizer, lf):
-    running_loss = 0.0
-
-    for i, (inputs, labels) in enumerate(loader):
-        o.zero_grad()
-        loss = get_loss(m, inputs, labels, lf)
-        loss.backward()
-        o.step()
-
-        running_loss += loss.item()
-
-        if (i + 1) % 10 == 0:
-            print(f"{i + 1} / {len(loader)} -- running loss: {running_loss / (i + 1)}")
-
-    return m, running_loss / len(loader)
-
-
-def score_model(m: nn.Module, loader: DataLoader, lf: nn.Module):
-    running_loss = 0.0
-
-    for i, (inputs, labels) in enumerate(loader):
-        loss = get_loss(m, inputs, labels, lf)
-        running_loss += loss.item()
-
-        if (i + 1) % 10 == 0:
-            print(f"{i + 1} / {len(loader)} -- running loss: {running_loss / (i + 1)}")
-
-    return running_loss / len(loader)
 
 
 def get_best_model(model_type: str, root_dir: str):
@@ -163,30 +168,56 @@ def main(
             .to_pandas()
             .stars.apply(lambda r: (0.0 if r <= 3 else 1.0) if r <= 4 else 2.0)
         ),
-    ).take(list(range(dataset_size)))
+    )
     _, class_counts = np.unique(
         photos_scores.select(["star_category"]).to_pandas().values, return_counts=True
     )
     weights = [(class_counts.sum() - x) / (x + 1e-5) for x in iter(class_counts)]
 
     # %%
-    yelp_photos = ImageData(
-        photos_scores.select(["star_category"]).to_pandas().star_category,
-        photos_scores.select(["photo_id"]).to_pandas().photo_id,
+    train_transforms = get_train_transforms(model_type)
+    eval_transforms = get_transforms(model_type)
+
+    star_categories = photos_scores.select(["star_category"]).to_pandas().star_category
+    photo_ids = photos_scores.select(["photo_id"]).to_pandas().photo_id
+
+    generator = torch.Generator().manual_seed(42)
+    train_size = int(0.8 * dataset_size)
+    val_size = int(0.1 * dataset_size)
+
+    indices = torch.randperm(dataset_size, generator=generator).tolist()
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size : train_size + val_size]
+    test_indices = indices[train_size + val_size :]
+
+    train_dataset = ImageData(
+        star_categories.iloc[train_indices].reset_index(drop=True),
+        photo_ids.iloc[train_indices].reset_index(drop=True),
         PHOTO_DIR,
-        transform=transforms,
+        transform=train_transforms,
+    )
+    val_dataset = ImageData(
+        star_categories.iloc[val_indices].reset_index(drop=True),
+        photo_ids.iloc[val_indices].reset_index(drop=True),
+        PHOTO_DIR,
+        transform=eval_transforms,
+    )
+    test_dataset = ImageData(
+        star_categories.iloc[test_indices].reset_index(drop=True),
+        photo_ids.iloc[test_indices].reset_index(drop=True),
+        PHOTO_DIR,
+        transform=eval_transforms,
     )
 
-    train, val, test = torch.utils.data.random_split(yelp_photos, [0.5, 0.3, 0.2])
     training_loader = DataLoader(
-        train,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=4,
         persistent_workers=True,
     )
-    test_loader = DataLoader(test, batch_size=batch_size, num_workers=4)
-    validation_loader = DataLoader(val, batch_size=batch_size, num_workers=4)
+    validation_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, num_workers=4)
 
     writer = SummaryWriter(f"logs/{model_type}_{format(timestamp)}")
     opt = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -196,17 +227,19 @@ def main(
     summary(model)
 
     # %%
-    for _ in range(epochs):
+    for e in range(epochs):
         epoch_number += 1
-        print(f"EPOCH {epoch_number}")
+        print(f"{datetime.now().strftime('%H:%M -- ')}EPOCH {epoch_number}")
         st = time.time()
         model.train(True)
-        model, tloss = train_one_epoch(model, training_loader, opt, loss_fn)
+        model, tloss = loop.train_one_epoch(
+            model, training_loader, opt, loss_fn, DEVICE
+        )
 
         model.eval()
         with torch.no_grad():
             print(f"EVALUATING MODEL FOR EPOCH {epoch_number}")
-            vloss = score_model(model, validation_loader, loss_fn)
+            vloss = loop.score_model(model, validation_loader, loss_fn, DEVICE)
 
         print(f"LOSS train {round(tloss, 5)}, validation {round(vloss, 5)}")
         writer.add_scalars(
@@ -222,7 +255,11 @@ def main(
             torch.save(model.state_dict(), model_path)
             print("***saved***")
 
-        print(f"EPOCH TIME: {time.time() - st}")
+        epoch_time = time.time() - st
+        print(f"EPOCH TIME: {epoch_time}")
+        if (e % 3 == 0 or epoch_time > 2000) and DEVICE == "mps":
+            print("cooldown")
+            time.sleep(10 * 60)
 
     model, locn = get_best_model(model_type, root_dir)
     run_classification(model, root_dir, locn, test_loader)
