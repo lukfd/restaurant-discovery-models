@@ -14,3 +14,5 @@ models/resnet/*
 *__pycache__*
 .venv*
 *.DS_Store*
+
+notebooks/models/clip_label_model/
